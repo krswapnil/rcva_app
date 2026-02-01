@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "490639934084",
+    "project_id": "rcva-fbb0e",
+    "storage_bucket": "rcva-fbb0e.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:490639934084:android:17c84a9ec42cf8a7c778d1",
+        "android_client_info": {
+          "package_name": "org.savelife.rcva"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "490639934084-g44rivvr7bip8p9vq15nlkil622nokkr.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "org.savelife.rcva",
+            "certificate_hash": "83822c5e5be01eba8c9607f014f64c53b1f62875"
+          }
+        },
+        {
+          "client_id": "490639934084-qh6gi9m6ltad43db5i870tdp2gnpq2ft.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA4tti6JOiI7eAS3QH6jLZ6RYdqTvw0PsQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "490639934084-qh6gi9m6ltad43db5i870tdp2gnpq2ft.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
