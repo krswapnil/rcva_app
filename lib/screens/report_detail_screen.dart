@@ -1,12 +1,11 @@
+// lib/screens/report_detail_screen.dart
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:share_plus/share_plus.dart';
-import 'package:printing/printing.dart';
 
 import '../services/firestore_service.dart';
 import '../services/placeholder_docx_export_service.dart';
-import '../services/pdf_export_service.dart';
 
 import '../models/report_model.dart';
 import '../models/location_model.dart';
@@ -26,12 +25,16 @@ class ReportDetailScreen extends StatefulWidget {
 class _ReportDetailScreenState extends State<ReportDetailScreen> {
   final fs = FirestoreService();
   final docxService = PlaceholderDocxExportService();
-  final pdfService = PdfExportService();
 
   ReportModel? report;
   bool loadingReport = true;
-
   bool exporting = false;
+
+  // ✅ chunk size (20 locations per share)
+  static const int _chunkSize = 20;
+
+  // ✅ numeric-safe parsing helper
+  int _locNoAsInt(String s) => int.tryParse(s.trim()) ?? 999999;
 
   @override
   void initState() {
@@ -70,131 +73,210 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
   }
 
   // =========================================================
-  // EXPORT HELPERS
+  // PROGRESS DIALOG ✅ (no LateInitializationError)
   // =========================================================
-  Future<(List<LocationModel>, List<IssueModel>)> _loadExportData() async {
-    final locations = await fs.watchLocations(widget.reportId).first;
+  Future<T> _runWithProgressDialog<T>({
+    required String title,
+    required Future<T> Function(void Function(String, int, int) onProgress) task,
+  }) async {
+    double value = 0.0;
+    String message = 'Starting…';
+
+    void Function(void Function())? setLocalState;
+
+    String? pendingMsg;
+    int? pendingCur;
+    int? pendingTotal;
+
+    void safeProgress(String msg, int cur, int total) {
+      if (setLocalState == null) {
+        pendingMsg = msg;
+        pendingCur = cur;
+        pendingTotal = total;
+        return;
+      }
+
+      final v = (total <= 0) ? 0.0 : (cur / total);
+      setLocalState!(() {
+        message = msg;
+        value = v;
+      });
+    }
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setStateSB) {
+            setLocalState = setStateSB;
+
+            // flush buffered progress once dialog is ready
+            if (pendingMsg != null) {
+              final tot = pendingTotal ?? 1;
+              final cur = pendingCur ?? 0;
+              final v = (tot <= 0) ? 0.0 : (cur / tot);
+
+              setLocalState!(() {
+                message = pendingMsg!;
+                value = v;
+              });
+
+              pendingMsg = null;
+              pendingCur = null;
+              pendingTotal = null;
+            }
+
+            return AlertDialog(
+              title: Text(title),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  LinearProgressIndicator(value: value == 0 ? null : value),
+                  const SizedBox(height: 12),
+                  Text(message),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+
+    try {
+      final result = await task(safeProgress);
+      if (mounted) Navigator.of(context, rootNavigator: true).pop();
+      return result;
+    } catch (_) {
+      if (mounted) Navigator.of(context, rootNavigator: true).pop();
+      rethrow;
+    }
+  }
+
+  // =========================================================
+  // EXPORT DATA ✅ ASC SORT FOR DOCX (1 → N)
+  // =========================================================
+  Future<(List<LocationModel>, List<IssueModel>)> _loadExportData({
+    void Function(String, int, int)? onProgress,
+  }) async {
+    onProgress?.call('Loading locations…', 0, 1);
+    await Future.delayed(Duration.zero);
+
+    final locationsRaw = await fs.watchLocations(widget.reportId).first;
+
+    // ✅ export MUST be ASC: 1 → N
+    final locations = [...locationsRaw]
+      ..sort((a, b) => _locNoAsInt(a.locationNo).compareTo(_locNoAsInt(b.locationNo)));
+
+    onProgress?.call('Loading issues list…', 0, 1);
+    await Future.delayed(Duration.zero);
+
     final issues = await fs.watchAllIssues().first;
+
+    onProgress?.call('Data ready ✅', 1, 1);
+    await Future.delayed(Duration.zero);
+
     return (locations, issues);
   }
 
   // =========================================================
-  // EXPORT (DOCX)
+  // CHUNK HELPERS
   // =========================================================
-  Future<File?> _exportDocxFile() async {
+  int _partsCount(int totalLocations) {
+    if (totalLocations <= 0) return 0;
+    return ((totalLocations + _chunkSize - 1) ~/ _chunkSize);
+  }
+
+  String _partLabel(int partIndex1Based, int totalLocations) {
+    // labels based on ASC export ordering (1..N)
+    final start = ((partIndex1Based - 1) * _chunkSize) + 1;
+    int end = partIndex1Based * _chunkSize;
+    if (end > totalLocations) end = totalLocations;
+    return 'Part $partIndex1Based ($start–$end)';
+  }
+
+  // =========================================================
+  // EXPORT DOCX FOR A PART + PROGRESS
+  // =========================================================
+  Future<File?> _exportDocxPartWithProgress({
+    required int partIndex1Based,
+    required int totalLocations,
+    required void Function(String, int, int) onProgress,
+  }) async {
     if (report == null) return null;
 
-    final (locations, issues) = await _loadExportData();
+    final (locations, issues) = await _loadExportData(onProgress: onProgress);
+
+    final startIndex = (partIndex1Based - 1) * _chunkSize;
+    final count = _chunkSize;
+
+    final suffix = 'Part_$partIndex1Based';
 
     final file = await docxService.exportReportAsDocx(
       report: report!,
       locations: locations,
       allIssues: issues,
+      onProgress: onProgress,
+      startIndex: startIndex,
+      count: count,
+      fileSuffix: suffix,
     );
+
     return file;
   }
 
-  Future<void> _exportAndShareDocx() async {
+  // =========================================================
+  // SHARE PART
+  // =========================================================
+  Future<void> _exportAndSharePart(int partIndex1Based, int totalLocations) async {
     if (report == null) return;
     if (exporting) return;
 
     setState(() => exporting = true);
     try {
-      final file = await _exportDocxFile();
-      if (file == null) return;
+      final label = _partLabel(partIndex1Based, totalLocations);
 
+      final file = await _runWithProgressDialog<File?>(
+        title: 'Exporting DOCX ($label)',
+        task: (onProgress) async {
+          return _exportDocxPartWithProgress(
+            partIndex1Based: partIndex1Based,
+            totalLocations: totalLocations,
+            onProgress: onProgress,
+          );
+        },
+      );
+
+      if (file == null) return;
       if (!mounted) return;
 
-      final subject = report!.name.isNotEmpty ? report!.name : 'RCVA Report';
+      final subjectBase = report!.name.isNotEmpty ? report!.name : 'RCVA Report';
+      final safeName = subjectBase.trim().isEmpty ? 'RCVA_Report' : subjectBase.trim();
 
       final x = XFile(
         file.path,
-        mimeType:
-            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        name: '${subject.trim().isEmpty ? "RCVA_Report" : subject}.docx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        name: '${safeName}_Part_$partIndex1Based.docx',
       );
 
       await Share.shareXFiles(
         [x],
-        subject: subject,
-        text: 'RCVA Report (DOCX)',
+        subject: '$subjectBase - Part $partIndex1Based',
+        text: 'RCVA Report DOCX ($label)',
       );
     } catch (e, st) {
       // ignore: avoid_print
       print('❌ DOCX export/share failed: $e');
       // ignore: avoid_print
       print(st);
-
-      if (!mounted) return;
-      _snack('Export/share failed: $e');
-    } finally {
-      if (mounted) setState(() => exporting = false);
-    }
-  }
-
-  Future<void> _exportOnlyDocx() async {
-    if (report == null) return;
-    if (exporting) return;
-
-    setState(() => exporting = true);
-    try {
-      final file = await _exportDocxFile();
-      if (file == null) return;
-
-      if (!mounted) return;
-      _snack('Exported: ${file.path}');
-    } catch (e, st) {
-      // ignore: avoid_print
-      print('❌ DOCX export failed: $e');
-      // ignore: avoid_print
-      print(st);
-
-      if (!mounted) return;
-      _snack('Export failed: $e');
+      if (mounted) _snack('Export/share failed: $e');
     } finally {
       if (mounted) setState(() => exporting = false);
     }
   }
 
   // =========================================================
-  // EXPORT (PDF) ✅ FULL IMPLEMENTATION
-  // =========================================================
-  Future<void> _exportAndSharePdf() async {
-    if (report == null) return;
-    if (exporting) return;
-
-    setState(() => exporting = true);
-    try {
-      final (locations, issues) = await _loadExportData();
-
-      final file = await pdfService.exportReportAsPdf(
-        report: report!,
-        locations: locations,
-        allIssues: issues,
-      );
-
-      final bytes = await file.readAsBytes();
-
-      // ✅ Best share method for PDF (opens everywhere)
-      await Printing.sharePdf(
-        bytes: bytes,
-        filename: file.uri.pathSegments.last,
-      );
-    } catch (e, st) {
-      // ignore: avoid_print
-      print('❌ PDF export/share failed: $e');
-      // ignore: avoid_print
-      print(st);
-
-      if (!mounted) return;
-      _snack('PDF export/share failed: $e');
-    } finally {
-      if (mounted) setState(() => exporting = false);
-    }
-  }
-
-  // =========================================================
-  // EDIT REPORT
+  // EDIT REPORT (unchanged)
   // =========================================================
   Future<void> _editReportDialog() async {
     if (report == null) return;
@@ -225,9 +307,7 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
     }
 
     String fmt(DateTime d) {
-      const m = [
-        'Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'
-      ];
+      const m = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
       return '${d.day.toString().padLeft(2, '0')} ${m[d.month - 1]} ${d.year}';
     }
 
@@ -293,7 +373,7 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
   }
 
   // =========================================================
-  // DELETE PROJECT
+  // DELETE PROJECT (unchanged)
   // =========================================================
   Future<void> _deleteProjectFlow() async {
     final firstOk = await showDialog<bool>(
@@ -356,10 +436,8 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
 
     try {
       await fs.deleteReportDeep(widget.reportId);
-
       if (!mounted) return;
       _snack('Project deleted from Firebase. Photos remain on device.');
-
       Navigator.pop(context);
     } catch (e) {
       if (!mounted) return;
@@ -368,7 +446,7 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
   }
 
   // =========================================================
-  // DELETE LOCATION
+  // DELETE LOCATION (unchanged)
   // =========================================================
   Future<void> _confirmDelete(LocationModel loc) async {
     final ok = await showDialog<bool>(
@@ -399,9 +477,7 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
   Widget _thumb(String? path) {
     if (path == null || path.trim().isEmpty) return _emptyThumb(Icons.image_not_supported);
 
-    if (path.startsWith('http://') || path.startsWith('https://')) {
-      return _emptyThumb(Icons.cloud);
-    }
+    if (path.startsWith('http://') || path.startsWith('https://')) return _emptyThumb(Icons.cloud);
 
     final f = File(path);
     if (!f.existsSync()) return _emptyThumb(Icons.broken_image);
@@ -423,9 +499,7 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
   }
 
   String _fmt(DateTime d) {
-    const m = [
-      'Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'
-    ];
+    const m = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     return '${d.day.toString().padLeft(2, '0')} ${m[d.month - 1]} ${d.year}';
   }
 
@@ -434,34 +508,25 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
   // =========================================================
   @override
   Widget build(BuildContext context) {
-    final title = loadingReport
-        ? 'Loading...'
-        : (report?.name.isNotEmpty == true ? report!.name : 'Project');
+    final title = loadingReport ? 'Loading...' : (report?.name.isNotEmpty == true ? report!.name : 'Project');
 
     return Scaffold(
       appBar: AppBar(
         title: Text(title),
         actions: [
-          // ✅ DOCX export/share
+          // ✅ quick share Part 1
           IconButton(
             icon: exporting
-                ? const SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
+                ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
                 : const Icon(Icons.description_outlined),
-            tooltip: 'Export & Share (DOCX)',
-            onPressed: (report == null || exporting) ? null : _exportAndShareDocx,
+            tooltip: 'Share Part 1 (DOCX)',
+            onPressed: (report == null || exporting)
+                ? null
+                : () async {
+                    final locs = await fs.watchLocations(widget.reportId).first;
+                    await _exportAndSharePart(1, locs.length);
+                  },
           ),
-
-          // ✅ PDF export/share
-          IconButton(
-            icon: const Icon(Icons.picture_as_pdf_outlined),
-            tooltip: 'Export & Share (PDF)',
-            onPressed: (report == null || exporting) ? null : _exportAndSharePdf,
-          ),
-
           IconButton(
             icon: const Icon(Icons.edit),
             tooltip: 'Edit project',
@@ -470,15 +535,9 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
           PopupMenuButton<String>(
             tooltip: 'More',
             onSelected: (v) async {
-              if (v == 'exportOnly') {
-                await _exportOnlyDocx();
-              }
-              if (v == 'deleteProject') {
-                await _deleteProjectFlow();
-              }
+              if (v == 'deleteProject') await _deleteProjectFlow();
             },
             itemBuilder: (_) => const [
-              PopupMenuItem(value: 'exportOnly', child: Text('Export (DOCX)')),
               PopupMenuItem(value: 'deleteProject', child: Text('Delete Project')),
             ],
           ),
@@ -498,20 +557,22 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
       body: StreamBuilder<List<IssueModel>>(
         stream: fs.watchAllIssues(),
         builder: (context, issuesSnap) {
-          if (!issuesSnap.hasData) {
-            return const Center(child: CircularProgressIndicator());
-          }
+          if (!issuesSnap.hasData) return const Center(child: CircularProgressIndicator());
 
           final idToTitle = {for (final it in issuesSnap.data!) it.id: it.title};
 
           return StreamBuilder<List<LocationModel>>(
             stream: fs.watchLocations(widget.reportId),
             builder: (context, snap) {
-              if (!snap.hasData) {
-                return const Center(child: CircularProgressIndicator());
-              }
+              if (!snap.hasData) return const Center(child: CircularProgressIndicator());
 
-              final locations = snap.data!;
+              // ✅ UI MUST be DESC: N → 1
+              final locationsRaw = snap.data!;
+              final locations = [...locationsRaw]
+                ..sort((a, b) => _locNoAsInt(b.locationNo).compareTo(_locNoAsInt(a.locationNo)));
+
+              final totalLocs = locations.length;
+              final parts = _partsCount(totalLocs);
 
               return ListView(
                 padding: const EdgeInsets.fromLTRB(12, 12, 12, 90),
@@ -519,42 +580,58 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
                   Card(
                     child: Padding(
                       padding: const EdgeInsets.all(14),
-                      child: Row(
+                      child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          const Icon(Icons.assignment_outlined, size: 22),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Icon(Icons.assignment_outlined, size: 22),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      report?.name ?? 'Project',
+                                      style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+                                    ),
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      report == null ? '' : 'Dates: ${_fmt(report!.startDate)}  →  ${_fmt(report!.endDate)}',
+                                      style: TextStyle(color: Colors.black.withOpacity(0.7)),
+                                    ),
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      'Locations: $totalLocs',
+                                      style: TextStyle(color: Colors.black.withOpacity(0.7)),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              IconButton(
+                                onPressed: report == null ? null : _editReportDialog,
+                                icon: const Icon(Icons.edit),
+                                tooltip: 'Edit',
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+
+                          // ✅ ONLY SHARE buttons (Part 1..N) — labels remain ASC ranges
+                          if (parts > 0)
+                            Wrap(
+                              spacing: 10,
+                              runSpacing: 10,
                               children: [
-                                Text(
-                                  report?.name ?? 'Project',
-                                  style: const TextStyle(
-                                    fontSize: 16,
-                                    fontWeight: FontWeight.w800,
+                                for (int p = 1; p <= parts; p++)
+                                  ElevatedButton.icon(
+                                    onPressed: (report == null || exporting) ? null : () => _exportAndSharePart(p, totalLocs),
+                                    icon: const Icon(Icons.share),
+                                    label: Text('Share ${_partLabel(p, totalLocs)}'),
                                   ),
-                                ),
-                                const SizedBox(height: 6),
-                                Text(
-                                  report == null
-                                      ? ''
-                                      : 'Dates: ${_fmt(report!.startDate)}  →  ${_fmt(report!.endDate)}',
-                                  style: TextStyle(color: Colors.black.withOpacity(0.7)),
-                                ),
-                                const SizedBox(height: 6),
-                                Text(
-                                  'Locations: ${locations.length}',
-                                  style: TextStyle(color: Colors.black.withOpacity(0.7)),
-                                ),
                               ],
                             ),
-                          ),
-                          IconButton(
-                            onPressed: report == null ? null : _editReportDialog,
-                            icon: const Icon(Icons.edit),
-                            tooltip: 'Edit',
-                          )
                         ],
                       ),
                     ),
@@ -566,16 +643,9 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
                         padding: const EdgeInsets.all(18),
                         child: Column(
                           children: [
-                            Icon(
-                              Icons.location_off_outlined,
-                              size: 40,
-                              color: Colors.black.withOpacity(0.55),
-                            ),
+                            Icon(Icons.location_off_outlined, size: 40, color: Colors.black.withOpacity(0.55)),
                             const SizedBox(height: 10),
-                            const Text(
-                              'No locations added yet',
-                              style: TextStyle(fontWeight: FontWeight.w700),
-                            ),
+                            const Text('No locations added yet', style: TextStyle(fontWeight: FontWeight.w700)),
                             const SizedBox(height: 6),
                             Text(
                               'Tap “Add Location” to start adding photos and issues.',
@@ -598,10 +668,7 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
                         Navigator.pushNamed(
                           context,
                           LocationEditScreen.routeName,
-                          arguments: LocationEditArgs(
-                            reportId: widget.reportId,
-                            locationId: l.id,
-                          ),
+                          arguments: LocationEditArgs(reportId: widget.reportId, locationId: l.id),
                         );
                       },
                       onDelete: () => _confirmDelete(l),
@@ -640,9 +707,7 @@ class _LocationCard extends StatelessWidget {
       (idx) => idx < location.imagePaths.length ? location.imagePaths[idx] : '',
     );
 
-    final caps = List.generate(4, (idx) => captionBuilder(idx))
-        .where((e) => e.trim().isNotEmpty)
-        .toList();
+    final caps = List.generate(4, (idx) => captionBuilder(idx)).where((e) => e.trim().isNotEmpty).toList();
 
     return Card(
       child: InkWell(

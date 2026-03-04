@@ -21,6 +21,7 @@ class _IssuesMasterScreenState extends State<IssuesMasterScreen> {
   String categoryFilter = 'ALL'; // ALL / ENGINEERING / ENFORCEMENT
 
   bool _cleaning = false;
+  bool _reseeding = false;
 
   @override
   void initState() {
@@ -191,13 +192,42 @@ class _IssuesMasterScreenState extends State<IssuesMasterScreen> {
 
     try {
       final removed = await fs.cleanupAndCanonicalizeIssues();
-      _snack(removed == 0
-          ? 'No duplicates found ✅'
-          : 'Removed $removed duplicate issue(s) ✅');
+      _snack(removed == 0 ? 'No duplicates found ✅' : 'Removed $removed duplicate issue(s) ✅');
     } catch (e) {
       _snack('Cleanup failed: $e');
     } finally {
       if (mounted) setState(() => _cleaning = false);
+    }
+  }
+
+  Future<void> _reseedFromSeedDart() async {
+    if (_reseeding) return;
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Update seed.dart to Firebase?'),
+        content: const Text(
+          'This will DELETE old SEED issues from Firebase and upload the latest seed.dart.\n\n'
+          '✅ User-added issues will NOT be deleted.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          ElevatedButton(onPressed: () => Navigator.pop(context, true), child: const Text('Update')),
+        ],
+      ),
+    );
+
+    if (ok != true) return;
+
+    setState(() => _reseeding = true);
+    try {
+      await fs.reseedFromApp(issuesSeed);
+      _snack('✅ Seed updated in Firebase');
+    } catch (e) {
+      _snack('Reseed failed: $e');
+    } finally {
+      if (mounted) setState(() => _reseeding = false);
     }
   }
 
@@ -211,9 +241,26 @@ class _IssuesMasterScreenState extends State<IssuesMasterScreen> {
             onSelected: (v) async {
               if (v == 'dedupe') {
                 await _runDuplicateCleanup();
+              } else if (v == 'reseed') {
+                await _reseedFromSeedDart();
+              } else if (v == 'debug') {
+                await fs.debugCategoryCounts();
+                _snack('Debug printed in console');
               }
             },
             itemBuilder: (_) => [
+              PopupMenuItem(
+                value: 'reseed',
+                enabled: !_reseeding,
+                child: Row(
+                  children: [
+                    const Icon(Icons.sync, size: 18),
+                    const SizedBox(width: 10),
+                    Text(_reseeding ? 'Updating seed...' : 'Update seed.dart to Firebase'),
+                  ],
+                ),
+              ),
+              const PopupMenuDivider(),
               PopupMenuItem(
                 value: 'dedupe',
                 enabled: !_cleaning,
@@ -222,6 +269,17 @@ class _IssuesMasterScreenState extends State<IssuesMasterScreen> {
                     const Icon(Icons.cleaning_services, size: 18),
                     const SizedBox(width: 10),
                     Text(_cleaning ? 'Removing duplicates...' : 'Remove duplicate issues'),
+                  ],
+                ),
+              ),
+              const PopupMenuDivider(),
+              const PopupMenuItem(
+                value: 'debug',
+                child: Row(
+                  children: [
+                    Icon(Icons.bug_report, size: 18),
+                    SizedBox(width: 10),
+                    Text('Debug category counts'),
                   ],
                 ),
               ),
@@ -249,8 +307,7 @@ class _IssuesMasterScreenState extends State<IssuesMasterScreen> {
                         prefixIcon: Icon(Icons.search),
                         labelText: 'Search issues',
                       ),
-                      onChanged: (v) =>
-                          setState(() => query = v.trim().toLowerCase()),
+                      onChanged: (v) => setState(() => query = v.trim().toLowerCase()),
                     ),
                     const SizedBox(height: 10),
                     Align(
@@ -276,14 +333,10 @@ class _IssuesMasterScreenState extends State<IssuesMasterScreen> {
                 var items = snapshot.data!;
 
                 if (query.isNotEmpty) {
-                  items = items
-                      .where((e) => e.title.toLowerCase().contains(query))
-                      .toList();
+                  items = items.where((e) => e.title.toLowerCase().contains(query)).toList();
                 }
                 if (categoryFilter != 'ALL') {
-                  items = items
-                      .where((e) => e.category.toUpperCase() == categoryFilter)
-                      .toList();
+                  items = items.where((e) => e.category.toUpperCase() == categoryFilter).toList();
                 }
 
                 if (items.isEmpty) {
@@ -318,13 +371,11 @@ class _IssuesMasterScreenState extends State<IssuesMasterScreen> {
                                 ),
                                 const SizedBox(width: 10),
                                 Container(
-                                  padding: const EdgeInsets.symmetric(
-                                      horizontal: 10, vertical: 6),
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                                   decoration: BoxDecoration(
                                     color: badgeColor.withOpacity(0.12),
                                     borderRadius: BorderRadius.circular(999),
-                                    border: Border.all(
-                                        color: badgeColor.withOpacity(0.3)),
+                                    border: Border.all(color: badgeColor.withOpacity(0.3)),
                                   ),
                                   child: Text(
                                     _prettyCategory(cat),

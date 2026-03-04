@@ -1,3 +1,4 @@
+// lib/services/firestore_service.dart
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
@@ -9,22 +10,17 @@ class FirestoreService {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
 
   // ✅ Issues are GLOBAL (same master list for everyone)
-  CollectionReference<Map<String, dynamic>> get _issuesCol =>
-      _db.collection('issues_master');
+  CollectionReference<Map<String, dynamic>> get _issuesCol => _db.collection('issues_master');
 
   // ✅ Reports are USER-SCOPED (projects within logged-in ID)
   String get _uid {
     final u = FirebaseAuth.instance.currentUser;
-    if (u == null) {
-      throw Exception('Not logged in');
-    }
+    if (u == null) throw Exception('Not logged in');
     return u.uid;
   }
 
-  CollectionReference<Map<String, dynamic>> get _reportsCol => _db
-      .collection('users')
-      .doc(_uid)
-      .collection('reports');
+  CollectionReference<Map<String, dynamic>> get _reportsCol =>
+      _db.collection('users').doc(_uid).collection('reports');
 
   // ------------------------------------------------------------
   // Helpers
@@ -39,19 +35,14 @@ class FirestoreService {
         .trim();
   }
 
-  /// ✅ FIXED: tolerant category normalization.
-  /// - Keeps exact ENGINEERING / ENFORCEMENT
-  /// - Detects variants like "Enforcement Issues", "Traffic Police", etc.
-  /// - Falls back to ENGINEERING
+  /// Category normalization (tolerant).
   String _normCategory(dynamic v) {
     final s = (v ?? '').toString().trim().toUpperCase();
     if (s.isEmpty) return 'ENGINEERING';
 
-    // exact
     if (s == 'ENFORCEMENT') return 'ENFORCEMENT';
     if (s == 'ENGINEERING') return 'ENGINEERING';
 
-    // tolerant detection
     if (s.contains('ENFORCE') ||
         s.contains('POLICE') ||
         s.contains('RTO') ||
@@ -83,14 +74,7 @@ class FirestoreService {
   // ------------------------------------------------------------
   // DEBUG
   // ------------------------------------------------------------
-  Future<int> debugCountIssues() async {
-    final snap = await _issuesCol.get();
-    // ignore: avoid_print
-    print('debugCountIssues: total docs in issues_master = ${snap.docs.length}');
-    return snap.docs.length;
-  }
 
-  /// ✅ Helpful debug: see if ENFORCEMENT docs exist and how many.
   Future<void> debugCategoryCounts() async {
     final snap = await _issuesCol.get();
     int eng = 0, enf = 0, other = 0;
@@ -107,18 +91,49 @@ class FirestoreService {
     }
 
     // ignore: avoid_print
-    print(
-      'debugCategoryCounts => ENGINEERING=$eng, ENFORCEMENT=$enf, OTHER=$other, TOTAL=${snap.docs.length}',
-    );
+    print('debugCategoryCounts => ENGINEERING=$eng, ENFORCEMENT=$enf, OTHER=$other, TOTAL=${snap.docs.length}');
   }
 
   // ------------------------------------------------------------
-  // Ensure issues ready (seed + migrate old docs + ensure enforcement exists)
+  // Ensure issues ready (seed + migrate old docs)
   // ------------------------------------------------------------
+
   Future<void> ensureIssuesReady(List<IssueModel> seed) async {
-    await seedIfEmpty(seed);
-    await seedCategoryIfMissing();
+    await seedIfEmpty(seed);           // only if empty
+    await seedCategoryIfMissing();     // migrate missing category
+    await migrateSourceIfMissing();    // migrate missing source
     await seedEnforcementIfMissing(seed);
+  }
+
+  /// Migrates existing docs which don't have `source` -> default to 'seed'
+  Future<void> migrateSourceIfMissing() async {
+    final snap = await _issuesCol.get();
+    if (snap.docs.isEmpty) return;
+
+    WriteBatch batch = _db.batch();
+    int ops = 0;
+
+    Future<void> commitIfNeeded({bool force = false}) async {
+      if (ops >= 450 || (force && ops > 0)) {
+        await batch.commit();
+        batch = _db.batch();
+        ops = 0;
+      }
+    }
+
+    for (final d in snap.docs) {
+      final data = d.data();
+      if (data.containsKey('source')) continue;
+
+      batch.update(d.reference, {
+        'source': 'seed',
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+      ops++;
+      await commitIfNeeded();
+    }
+
+    await commitIfNeeded(force: true);
   }
 
   // ------------------------------------------------------------
@@ -127,6 +142,7 @@ class FirestoreService {
   // - Write/merge ONE canonical doc at deterministic ID
   // - Delete all other docs in that group
   // ------------------------------------------------------------
+
   Future<int> cleanupAndCanonicalizeIssues() async {
     final snap = await _issuesCol.get();
     if (snap.docs.isEmpty) return 0;
@@ -139,7 +155,6 @@ class FirestoreService {
       final titleNorm = _normTitle(titleRaw);
       if (titleNorm.isEmpty) continue;
 
-      // ✅ FIXED: normalize category robustly (prevents enforcement becoming engineering)
       final cat = _normCategory(data['category']);
       final key = '$cat|$titleNorm';
       groups.putIfAbsent(key, () => []).add(d);
@@ -166,7 +181,7 @@ class FirestoreService {
       final category = parts[0];
       final normalizedTitle = parts[1];
 
-      // Pick "best" doc as source: longest recommendation (usually most complete)
+      // pick best doc as winner: longest recommendation
       docs.sort((a, b) {
         final ar = (a.data()['recommendation'] ?? '').toString().length;
         final br = (b.data()['recommendation'] ?? '').toString().length;
@@ -180,20 +195,19 @@ class FirestoreService {
       final rec = (winnerData['recommendation'] ?? '').toString().trim();
       final isActive = (winnerData['isActive'] ?? true) == true;
 
-      // canonical deterministic doc id
-      final canonicalId = _issueDocId(
-        category,
-        title.isEmpty ? normalizedTitle : title,
-      );
+      // preserve source if present else default seed
+      final source = (winnerData['source'] ?? 'seed').toString();
+
+      final canonicalId = _issueDocId(category, title.isEmpty ? normalizedTitle : title);
       final canonicalRef = _issuesCol.doc(canonicalId);
 
-      // 1) Upsert canonical doc
       batch.set(
         canonicalRef,
         {
           'title': title.isEmpty ? normalizedTitle : title,
           'recommendation': rec,
           'category': category,
+          'source': source,
           'isActive': isActive,
           'updatedAt': FieldValue.serverTimestamp(),
           'createdAt': winnerData['createdAt'] ?? FieldValue.serverTimestamp(),
@@ -203,7 +217,6 @@ class FirestoreService {
       ops++;
       await commitIfNeeded();
 
-      // 2) Delete all docs in group except canonical doc id
       for (final d in docs) {
         if (d.id == canonicalId) continue;
         batch.delete(d.reference);
@@ -214,140 +227,143 @@ class FirestoreService {
     }
 
     await commitIfNeeded(force: true);
-
-    // ignore: avoid_print
-    print('cleanupAndCanonicalizeIssues: deleted $deleted duplicates');
     return deleted;
   }
 
   // ------------------------------------------------------------
   // Migration: add `category` to old docs that don't have it
   // ------------------------------------------------------------
+
   Future<void> seedCategoryIfMissing() async {
-    try {
-      final snap = await _issuesCol.get();
-      if (snap.docs.isEmpty) return;
+    final snap = await _issuesCol.get();
+    if (snap.docs.isEmpty) return;
 
-      final toUpdate = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+    final toUpdate = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
 
-      for (final d in snap.docs) {
-        final data = d.data();
-        final hasCategory = data.containsKey('category') &&
-            (data['category']?.toString().trim().isNotEmpty ?? false);
-        if (!hasCategory) toUpdate.add(d);
+    for (final d in snap.docs) {
+      final data = d.data();
+      final hasCategory =
+          data.containsKey('category') && (data['category']?.toString().trim().isNotEmpty ?? false);
+      if (!hasCategory) toUpdate.add(d);
+    }
+
+    if (toUpdate.isEmpty) return;
+
+    const chunkSize = 450;
+
+    for (int i = 0; i < toUpdate.length; i += chunkSize) {
+      final chunk = toUpdate.sublist(i, (i + chunkSize).clamp(0, toUpdate.length));
+      final batch = _db.batch();
+
+      for (final doc in chunk) {
+        final data = doc.data();
+        final agency = (data['agency'] ?? '').toString().trim().toUpperCase();
+
+        final isEnforcement = agency.contains('POLICE') ||
+            agency.contains('ENFORCEMENT') ||
+            agency.contains('RTO') ||
+            agency.contains('TRANSPORT') ||
+            agency.contains('TRAFFIC');
+
+        final cat = isEnforcement ? 'ENFORCEMENT' : 'ENGINEERING';
+
+        batch.update(doc.reference, {
+          'category': cat,
+          'updatedAt': FieldValue.serverTimestamp(),
+        });
       }
 
-      if (toUpdate.isEmpty) {
-        // ignore: avoid_print
-        print('seedCategoryIfMissing: nothing to migrate');
-        return;
-      }
-
-      const chunkSize = 450;
-      int migrated = 0;
-
-      for (int i = 0; i < toUpdate.length; i += chunkSize) {
-        final chunk =
-            toUpdate.sublist(i, (i + chunkSize).clamp(0, toUpdate.length));
-
-        final batch = _db.batch();
-
-        for (final doc in chunk) {
-          final data = doc.data();
-
-          // some older docs used "agency" to infer category
-          final agency = (data['agency'] ?? '').toString().trim().toUpperCase();
-
-          final isEnforcement = agency.contains('POLICE') ||
-              agency.contains('ENFORCEMENT') ||
-              agency.contains('RTO') ||
-              agency.contains('TRANSPORT') ||
-              agency.contains('TRAFFIC');
-
-          final cat = isEnforcement ? 'ENFORCEMENT' : 'ENGINEERING';
-
-          batch.update(doc.reference, {
-            'category': cat,
-            'updatedAt': FieldValue.serverTimestamp(),
-          });
-        }
-
-        await batch.commit();
-        migrated += chunk.length;
-      }
-
-      // ignore: avoid_print
-      print('seedCategoryIfMissing: migrated $migrated issue docs');
-    } catch (e) {
-      // ignore: avoid_print
-      print('seedCategoryIfMissing failed: $e');
-      rethrow;
+      await batch.commit();
     }
   }
 
   // ------------------------------------------------------------
-  // MASTER ISSUES (Idempotent seeding - prevents duplicates forever)
+  // MASTER ISSUES: Idempotent seeding
   // ------------------------------------------------------------
-  Future<void> forceSeedIssues(List<IssueModel> seed) async {
-    try {
-      const chunkSize = 450;
 
-      for (int i = 0; i < seed.length; i += chunkSize) {
-        final chunk = seed.sublist(i, (i + chunkSize).clamp(0, seed.length));
-        final batch = _db.batch();
+  Future<void> forceSeedIssues(List<IssueModel> seed, {required String source}) async {
+    const chunkSize = 450;
 
-        for (final it in chunk) {
-          final title = it.title.trim();
-          final rec = it.recommendation.trim();
+    for (int i = 0; i < seed.length; i += chunkSize) {
+      final chunk = seed.sublist(i, (i + chunkSize).clamp(0, seed.length));
+      final batch = _db.batch();
 
-          final category = _normCategory(
-            it.category.trim().isEmpty ? 'ENGINEERING' : it.category,
-          );
+      for (final it in chunk) {
+        final title = it.title.trim();
+        final rec = it.recommendation.trim();
+        final category = _normCategory(it.category);
 
-          final docId = _issueDocId(category, title);
-          final ref = _issuesCol.doc(docId);
+        final docId = _issueDocId(category, title);
+        final ref = _issuesCol.doc(docId);
 
-          batch.set(
-            ref,
-            {
-              'title': title,
-              'recommendation': rec,
-              'category': category,
-              'isActive': true,
-              'updatedAt': FieldValue.serverTimestamp(),
-              'createdAt': FieldValue.serverTimestamp(),
-            },
-            SetOptions(merge: true),
-          );
-        }
-
-        await batch.commit();
+        batch.set(
+          ref,
+          {
+            'title': title,
+            'recommendation': rec,
+            'category': category,
+            'source': source, // ✅ seed/user
+            'isActive': true,
+            'updatedAt': FieldValue.serverTimestamp(),
+            'createdAt': FieldValue.serverTimestamp(),
+          },
+          SetOptions(merge: true),
+        );
       }
-    } catch (e) {
-      rethrow;
+
+      await batch.commit();
     }
   }
 
   Future<void> seedIfEmpty(List<IssueModel> seed) async {
     final first = await _issuesCol.limit(1).get();
     if (first.docs.isNotEmpty) return;
-    await forceSeedIssues(seed);
+    await forceSeedIssues(seed, source: 'seed');
   }
 
   Future<void> seedEnforcementIfMissing(List<IssueModel> seed) async {
-    final existing = await _issuesCol
-        .where('category', isEqualTo: 'ENFORCEMENT')
-        .limit(1)
-        .get();
+    final existing = await _issuesCol.where('category', isEqualTo: 'ENFORCEMENT').limit(1).get();
     if (existing.docs.isNotEmpty) return;
 
-    final enforcementSeed = seed
-        .where((e) => _normCategory(e.category) == 'ENFORCEMENT')
-        .toList();
+    final enforcementSeed = seed.where((e) => _normCategory(e.category) == 'ENFORCEMENT').toList();
     if (enforcementSeed.isEmpty) return;
 
-    await forceSeedIssues(enforcementSeed);
+    await forceSeedIssues(enforcementSeed, source: 'seed');
   }
+
+  /// ✅ This is the button action:
+  /// - deletes only SEED issues
+  /// - inserts the current seed.dart
+  /// - keeps USER issues
+  Future<void> reseedFromApp(List<IssueModel> seed) async {
+    // delete only seed docs
+    final seedSnap = await _issuesCol.where('source', isEqualTo: 'seed').get();
+
+    WriteBatch batch = _db.batch();
+    int ops = 0;
+
+    Future<void> commitIfNeeded({bool force = false}) async {
+      if (ops >= 450 || (force && ops > 0)) {
+        await batch.commit();
+        batch = _db.batch();
+        ops = 0;
+      }
+    }
+
+    for (final d in seedSnap.docs) {
+      batch.delete(d.reference);
+      ops++;
+      await commitIfNeeded();
+    }
+    await commitIfNeeded(force: true);
+
+    // insert fresh seed
+    await forceSeedIssues(seed, source: 'seed');
+  }
+
+  // ------------------------------------------------------------
+  // WATCH ISSUES
+  // ------------------------------------------------------------
 
   Stream<List<IssueModel>> watchAllIssues() {
     return _issuesCol.orderBy('title').snapshots().map((snap) {
@@ -368,6 +384,12 @@ class FirestoreService {
     });
   }
 
+  // ------------------------------------------------------------
+  // UPSERT ISSUE (manual add/edit from app)
+  // - New issues => source='user'
+  // - Existing => keep existing source
+  // ------------------------------------------------------------
+
   Future<void> upsertIssue({
     String? id,
     required String title,
@@ -378,18 +400,14 @@ class FirestoreService {
     final r = recommendation.trim();
     final c = _normCategory(category);
 
-    if (c != 'ENGINEERING' && c != 'ENFORCEMENT') {
-      throw Exception('Invalid category');
-    }
-
     if (id == null) {
-      // deterministic id for manual add too
       final docId = _issueDocId(c, t);
       await _issuesCol.doc(docId).set(
         {
           'title': t,
           'recommendation': r,
           'category': c,
+          'source': 'user',
           'isActive': true,
           'createdAt': FieldValue.serverTimestamp(),
           'updatedAt': FieldValue.serverTimestamp(),
@@ -397,6 +415,7 @@ class FirestoreService {
         SetOptions(merge: true),
       );
     } else {
+      // keep source unchanged
       await _issuesCol.doc(id).update({
         'title': t,
         'recommendation': r,
@@ -459,25 +478,15 @@ class FirestoreService {
     return ReportModel.fromDoc(doc);
   }
 
-  /// OLD: only deletes report doc (kept for backward compatibility)
   Future<void> deleteReport(String reportId) async {
     await _reportsCol.doc(reportId).delete();
   }
 
-  // ------------------------------------------------------------
-  // ✅ DELETE REPORT (Deep) - deletes subcollection locations first,
-  // then deletes the report doc. DOES NOT touch local images.
-  // ------------------------------------------------------------
   Future<void> deleteReportDeep(String reportId) async {
-    // 1) delete locations subcollection in batches
     await _deleteCollectionInBatches(_locCol(reportId));
-
-    // 2) delete report doc
     await _reportsCol.doc(reportId).delete();
   }
 
-  /// Deletes all docs inside a CollectionReference in batches.
-  /// Safe for large collections.
   Future<void> _deleteCollectionInBatches(
     CollectionReference<Map<String, dynamic>> col, {
     int batchSize = 450,
@@ -495,7 +504,7 @@ class FirestoreService {
   }
 
   // ------------------------------------------------------------
-  // LOCATIONS (USER-SCOPED because they are under user reports)
+  // LOCATIONS (USER-SCOPED)
   // ------------------------------------------------------------
   CollectionReference<Map<String, dynamic>> _locCol(String reportId) =>
       _reportsCol.doc(reportId).collection('locations');
@@ -512,11 +521,7 @@ class FirestoreService {
     return ref.id;
   }
 
-  Future<void> updateLocation(
-    String reportId,
-    String locationId,
-    LocationModel location,
-  ) async {
+  Future<void> updateLocation(String reportId, String locationId, LocationModel location) async {
     await _locCol(reportId).doc(locationId).update(location.toUpdateMap());
   }
 

@@ -1,24 +1,28 @@
 // lib/screens/location_edit_screen.dart
+
+import 'dart:async' show unawaited;
 import 'dart:io';
 import 'dart:typed_data';
-import 'dart:ui' as ui; // ✅ for stamping gallery image
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
-import 'package:geolocator/geolocator.dart';
 import 'package:geocoding/geocoding.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
-import 'package:image/image.dart' as img; // ✅ for encode/decode
-import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 
-import '../models/location_model.dart';
+// ✅ save to phone gallery + permissions
+import 'package:image_gallery_saver/image_gallery_saver.dart';
+import 'package:permission_handler/permission_handler.dart';
+
 import '../models/issue_model.dart';
+import '../models/location_model.dart';
 import '../services/firestore_service.dart';
 import '../widgets/issue_multi_select.dart';
 import 'issues_master_screen.dart';
-
-// ✅ Camerawesome timestamp camera screen
 import 'timestamp_camera_aw.dart';
 
 class LocationEditArgs {
@@ -49,17 +53,17 @@ class _LocationEditScreenState extends State<LocationEditScreen>
   final locationNoC = TextEditingController();
   final locationNameC = TextEditingController();
   final policeC = TextEditingController();
-  final detailsC = TextEditingController();
 
   String agency = 'NHAI';
   double? lat;
   double? lng;
 
-  // ✅ resolved address from reverse geocoding
   String? resolvedAddress;
 
   final List<File?> imageFiles = List<File?>.filled(4, null);
   List<String> imagePaths = List<String>.filled(4, '');
+
+  final Map<int, bool> _isStamping = {0: false, 1: false, 2: false, 3: false};
 
   Map<String, List<String>> imageIssueIdsMap = {
     '0': <String>[],
@@ -76,12 +80,26 @@ class _LocationEditScreenState extends State<LocationEditScreen>
 
   late final String _draftKey;
 
+  // ✅ cache logo bytes once
+  Uint8List? _logoBytes;
+
+  // ✅ prevent “stuck” while opening Issue Picker
+  bool _issuePickerOpen = false;
+
   @override
   void initState() {
     super.initState();
     _tab = TabController(length: 2, vsync: this);
     _draftKey = 'draft_${DateTime.now().millisecondsSinceEpoch}';
+    _warmLogoBytes();
     if (widget.args.locationId != null) _loadExisting();
+  }
+
+  Future<void> _warmLogoBytes() async {
+    try {
+      final bd = await rootBundle.load('assets/branding/logo_savelife.png');
+      _logoBytes = bd.buffer.asUint8List();
+    } catch (_) {}
   }
 
   @override
@@ -90,7 +108,6 @@ class _LocationEditScreenState extends State<LocationEditScreen>
     locationNoC.dispose();
     locationNameC.dispose();
     policeC.dispose();
-    detailsC.dispose();
     super.dispose();
   }
 
@@ -105,21 +122,9 @@ class _LocationEditScreenState extends State<LocationEditScreen>
 
   String _currentLocationKey() => widget.args.locationId ?? _draftKey;
 
-  // ------------------ date helpers ------------------
   String _monthName(int m) {
     const names = [
-      'Jan',
-      'Feb',
-      'Mar',
-      'Apr',
-      'May',
-      'Jun',
-      'Jul',
-      'Aug',
-      'Sep',
-      'Oct',
-      'Nov',
-      'Dec'
+      'Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'
     ];
     return names[m - 1];
   }
@@ -134,7 +139,6 @@ class _LocationEditScreenState extends State<LocationEditScreen>
     return '$h:$mm:$ss $ampm';
   }
 
-  // ------------------ reverse geocoding ------------------
   Future<void> _resolveAddress() async {
     if (lat == null || lng == null) return;
 
@@ -155,12 +159,9 @@ class _LocationEditScreenState extends State<LocationEditScreen>
 
       if (!mounted) return;
       setState(() => resolvedAddress = addr);
-    } catch (_) {
-      // ignore geocode errors
-    }
+    } catch (_) {}
   }
 
-  // ------------------ local image folder helpers ------------------
   Future<Directory> _ensurePhotoDir() async {
     final base = await getApplicationDocumentsDirectory();
     final dir = Directory(
@@ -185,18 +186,22 @@ class _LocationEditScreenState extends State<LocationEditScreen>
     return File(sourcePath).copy(dstPath);
   }
 
-  // ------------------ load existing ------------------
+  Future<File> _copyExtraToTemp({required String sourcePath}) async {
+    final tmp = await getTemporaryDirectory();
+    final outDir = await Directory('${tmp.path}/rcva_extras').create(recursive: true);
+    final outPath = '${outDir.path}/extra_${DateTime.now().millisecondsSinceEpoch}.jpg';
+    return File(sourcePath).copy(outPath);
+  }
+
   Future<void> _loadExisting() async {
     setState(() => loading = true);
     try {
-      final loc =
-          await fs.getLocation(widget.args.reportId, widget.args.locationId!);
+      final loc = await fs.getLocation(widget.args.reportId, widget.args.locationId!);
       if (loc == null) return;
 
       locationNoC.text = loc.locationNo;
       locationNameC.text = loc.locationName;
       policeC.text = loc.policeStation;
-      detailsC.text = loc.details;
 
       agency = loc.agency;
       lat = loc.lat;
@@ -232,7 +237,6 @@ class _LocationEditScreenState extends State<LocationEditScreen>
     }
   }
 
-  // ------------------ GPS ------------------
   Future<Position?> _getCurrentPosition() async {
     final enabled = await Geolocator.isLocationServiceEnabled();
     if (!enabled) {
@@ -251,12 +255,9 @@ class _LocationEditScreenState extends State<LocationEditScreen>
       return null;
     }
 
-    return Geolocator.getCurrentPosition(
-      desiredAccuracy: LocationAccuracy.high,
-    );
+    return Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
   }
 
-  // ✅ fast gps update (no wait for reverse geocoding)
   Future<void> _captureGpsFast() async {
     final pos = await _getCurrentPosition();
     if (pos == null) return;
@@ -267,29 +268,76 @@ class _LocationEditScreenState extends State<LocationEditScreen>
       lng = pos.longitude;
     });
 
-    // don’t block camera opening
     _resolveAddress();
   }
 
-  // ------------------ stamp gallery image ------------------
-  Future<File> _stampGalleryImageToNewFile({
-    required String srcPath,
+  Future<void> _saveImageToGallery(File file) async {
+    try {
+      if (Platform.isAndroid) {
+        final photos = await Permission.photos.request();
+        final storage = await Permission.storage.request();
+        if (!photos.isGranted && !storage.isGranted) {
+          _snack('Gallery permission denied');
+          return;
+        }
+      }
+
+      final bytes = await file.readAsBytes();
+      await ImageGallerySaver.saveImage(
+        bytes,
+        quality: 90,
+        name: 'RCVA_${DateTime.now().millisecondsSinceEpoch}',
+      );
+    } catch (_) {
+      _snack('Failed to save to gallery');
+    }
+  }
+
+  // ------------------ STAMP LINES ------------------
+  Map<String, String> _buildStampLines() {
+    final now = DateTime.now();
+    final line1 =
+        '${now.day.toString().padLeft(2, '0')} ${_monthName(now.month)} ${now.year}, ${_formatTime(now)}';
+
+    final line2 = (lat != null && lng != null)
+        ? 'Lat: ${lat!.toStringAsFixed(6)}, Lng: ${lng!.toStringAsFixed(6)}'
+        : 'Lat: -, Lng: -';
+
+    final fallbackParts = <String>[
+      locationNameC.text.trim(),
+      policeC.text.trim(),
+    ].where((e) => e.isNotEmpty).toList();
+
+    final line3 = (resolvedAddress != null && resolvedAddress!.trim().isNotEmpty)
+        ? resolvedAddress!.trim()
+        : (fallbackParts.isEmpty ? '-' : fallbackParts.join(', '));
+
+    return {'l1': line1, 'l2': line2, 'l3': line3};
+  }
+
+  // ------------------ ONE STAMP IMPLEMENTATION (gallery-style) ------------------
+  /// ✅ Stamps `filePath` in-place using Canvas drawRRect (same look as gallery)
+  Future<void> _stampUiAndOverwriteFile({
+    required String filePath,
     required String line1,
     required String line2,
     required String line3,
   }) async {
-    final src = File(srcPath);
+    final src = File(filePath);
     final bytes = await src.readAsBytes();
 
-    // decode base
-    final codec = await ui.instantiateImageCodec(bytes);
+    // ✅ downscale decode for speed/memory
+    final codec = await ui.instantiateImageCodec(
+      bytes,
+      targetWidth: 2200, // adjust 1800–2600
+    );
     final frame = await codec.getNextFrame();
     final ui.Image base = frame.image;
 
-    // load logo
-    final bd = await rootBundle.load('assets/branding/logo_savelife.png');
-    final Uint8List logoBytes = bd.buffer.asUint8List();
-    final logoCodec = await ui.instantiateImageCodec(logoBytes);
+    _logoBytes ??=
+        (await rootBundle.load('assets/branding/logo_savelife.png')).buffer.asUint8List();
+
+    final logoCodec = await ui.instantiateImageCodec(_logoBytes!);
     final logoFrame = await logoCodec.getNextFrame();
     final ui.Image logo = logoFrame.image;
 
@@ -311,15 +359,13 @@ class _LocationEditScreenState extends State<LocationEditScreen>
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(recorder);
 
-    // draw base
     canvas.drawImage(base, Offset.zero, Paint());
 
-    // ✅ big stamp sizing
-    final boxPad = w * 0.030;
-    final lineGap = w * 0.012;
+    final boxPad = w * 0.015;
+    final lineGap = w * 0.006;
 
-    final fontSize = (w * 0.060).clamp(22.0, 64.0).toDouble();
-    final smallFont = (fontSize * 0.85).clamp(18.0, 54.0).toDouble();
+    final fontSize = (w * 0.030).clamp(14.0, 32.0).toDouble();
+    final smallFont = (fontSize * 0.85).clamp(12.0, 28.0).toDouble();
 
     final tp = TextPainter(
       text: TextSpan(
@@ -335,8 +381,7 @@ class _LocationEditScreenState extends State<LocationEditScreen>
       textDirection: TextDirection.ltr,
     )..layout(maxWidth: w * 0.78);
 
-    // ✅ bigger logo
-    final logoTargetH = (w * 0.145).clamp(55.0, 130.0).toDouble();
+    final logoTargetH = (w * 0.0725).clamp(35.0, 70.0).toDouble();
     final logoTargetW = logoTargetH * (logo.width / logo.height);
 
     final boxW = (tp.width + boxPad * 2).clamp(0.0, w * 0.88).toDouble();
@@ -350,18 +395,15 @@ class _LocationEditScreenState extends State<LocationEditScreen>
       Radius.circular((w * 0.02).toDouble()),
     );
 
-    // box bg
-    canvas.drawRRect(rect, Paint()..color = const Color(0xAA000000));
+    // ✅ slight transparent background
+    canvas.drawRRect(rect, Paint()..color = const Color(0x66000000));
 
-    // text
     tp.paint(canvas, Offset(rect.left + boxPad, rect.top + boxPad));
 
-    // logo bottom-right
     final logoX = rect.right - boxPad - logoTargetW;
     final logoY = rect.bottom - boxPad - logoTargetH;
     final dst = Rect.fromLTWH(logoX, logoY, logoTargetW, logoTargetH);
-    final srcRect =
-        Rect.fromLTWH(0, 0, logo.width.toDouble(), logo.height.toDouble());
+    final srcRect = Rect.fromLTWH(0, 0, logo.width.toDouble(), logo.height.toDouble());
     canvas.drawImageRect(logo, srcRect, dst, Paint());
 
     final picture = recorder.endRecording();
@@ -373,116 +415,199 @@ class _LocationEditScreenState extends State<LocationEditScreen>
     final decoded = img.decodePng(pngBytes);
     final jpgBytes = img.encodeJpg(decoded!, quality: 85);
 
-    final tmp = await getTemporaryDirectory();
-    final outDir =
-        await Directory('${tmp.path}/rcva_cam').create(recursive: true);
-    final outPath =
-        '${outDir.path}/gallery_stamped_${DateTime.now().millisecondsSinceEpoch}.jpg';
-
-    final outFile = File(outPath);
-    await outFile.writeAsBytes(jpgBytes, flush: true);
-    return outFile;
+    await File(filePath).writeAsBytes(jpgBytes, flush: true);
   }
 
-  // ------------------ photos ------------------
-
-  // ✅ UPDATED: open camera instantly (do NOT await GPS)
-  Future<void> _takePhoto(int index) async {
-    // start GPS update in background
-    _captureGpsFast();
-
-    final now = DateTime.now();
-    final line1 =
-        '${now.day.toString().padLeft(2, '0')} ${_monthName(now.month)} ${now.year}, ${_formatTime(now)}';
-
-    // Use latest known coords (may be '-' initially; camera screen will update live)
-    final line2 = (lat != null && lng != null)
-        ? 'Lat: ${lat!.toStringAsFixed(6)}, Lng: ${lng!.toStringAsFixed(6)}'
-        : 'Lat: -, Lng: -';
-
-    final fallbackParts = <String>[
-      locationNameC.text.trim(),
-      policeC.text.trim(),
-    ].where((e) => e.isNotEmpty).toList();
-
-    final line3 = (resolvedAddress != null && resolvedAddress!.trim().isNotEmpty)
-        ? resolvedAddress!.trim()
-        : (fallbackParts.isEmpty ? '-' : fallbackParts.join(', '));
-
-    final File? captured = await Navigator.push<File?>(
-      context,
-      MaterialPageRoute(
-        builder: (_) => TimestampCameraAwScreen(
-          overlayLine1: line1,
-          overlayLine2: line2,
-          overlayLine3: line3,
-        ),
-      ),
-    );
-
-    if (captured == null) return;
-
+  /// ✅ stamps savedPath and updates UI flags
+  Future<void> _stampSavedPhotoWithUi({
+    required int index,
+    required String savedPath,
+    required String line1,
+    required String line2,
+    required String line3,
+  }) async {
     try {
-      final savedFile = await _copyPhotoToAppFolder(
-        sourcePath: captured.path,
-        index: index,
-      );
-
-      setState(() {
-        imageFiles[index] = savedFile;
-        imagePaths[index] = savedFile.path;
-      });
-    } catch (e) {
-      _snack('Failed to save photo: $e');
-    }
-  }
-
-  Future<void> _pickFromGallery(int index) async {
-    await _captureGpsFast();
-
-    final picked = await picker.pickImage(
-      source: ImageSource.gallery,
-      imageQuality: 92,
-    );
-
-    if (picked == null) return;
-
-    final now = DateTime.now();
-    final line1 =
-        '${now.day.toString().padLeft(2, '0')} ${_monthName(now.month)} ${now.year}, ${_formatTime(now)}';
-
-    final line2 = (lat != null && lng != null)
-        ? 'Lat: ${lat!.toStringAsFixed(6)}, Lng: ${lng!.toStringAsFixed(6)}'
-        : 'Lat: -, Lng: -';
-
-    final fallbackParts = <String>[
-      locationNameC.text.trim(),
-      policeC.text.trim(),
-    ].where((e) => e.isNotEmpty).toList();
-
-    final line3 = (resolvedAddress != null && resolvedAddress!.trim().isNotEmpty)
-        ? resolvedAddress!.trim()
-        : (fallbackParts.isEmpty ? '-' : fallbackParts.join(', '));
-
-    try {
-      final stamped = await _stampGalleryImageToNewFile(
-        srcPath: picked.path,
+      await _stampUiAndOverwriteFile(
+        filePath: savedPath,
         line1: line1,
         line2: line2,
         line3: line3,
       );
 
+      // ✅ force refresh if Image.file cached old bytes
+      await FileImage(File(savedPath)).evict();
+
+      if (!mounted) return;
+
+      void applyUiUpdate() {
+        if (!mounted) return;
+        setState(() {
+          imageFiles[index] = File(savedPath);
+          imagePaths[index] = savedPath;
+          _isStamping[index] = false;
+        });
+      }
+
+      if (_issuePickerOpen) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          Future.delayed(const Duration(milliseconds: 220), applyUiUpdate);
+        });
+      } else {
+        applyUiUpdate();
+      }
+
+      await _saveImageToGallery(File(savedPath));
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _isStamping[index] = false);
+    }
+  }
+
+  // ------------------ photos ------------------
+  Future<void> _takePhoto(int index) async {
+    _captureGpsFast(); // fire and forget
+    final lines = _buildStampLines();
+
+    final Map<String, String>? result = await Navigator.push<Map<String, String>?>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => TimestampCameraAwScreen(
+          overlayLine1: lines['l1']!,
+          overlayLine2: lines['l2']!,
+          overlayLine3: lines['l3']!,
+        ),
+      ),
+    );
+
+    if (result == null) return;
+
+    final rawPath = (result['rawPath'] ?? '').trim();
+    if (rawPath.isEmpty) return;
+
+    try {
       final savedFile = await _copyPhotoToAppFolder(
-        sourcePath: stamped.path,
+        sourcePath: rawPath,
+        index: index,
+      );
+
+      // ✅ instant preview
+      if (!mounted) return;
+      setState(() {
+        imageFiles[index] = savedFile;
+        imagePaths[index] = savedFile.path;
+        _isStamping[index] = true;
+      });
+
+      // ✅ stamp in background (do NOT await)
+      unawaited(_stampSavedPhotoWithUi(
+        index: index,
+        savedPath: savedFile.path,
+        line1: lines['l1']!,
+        line2: lines['l2']!,
+        line3: lines['l3']!,
+      ));
+    } catch (e) {
+      _snack('Failed to save photo: $e');
+    }
+  }
+
+  // ✅ Gallery pick WITH stamp (instant preview + background stamp)
+  Future<void> _pickFromGalleryWithStamp(int index) async {
+    _captureGpsFast();
+
+    final picked = await picker.pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 92,
+    );
+    if (picked == null) return;
+
+    final lines = _buildStampLines();
+
+    try {
+      final savedFile = await _copyPhotoToAppFolder(
+        sourcePath: picked.path,
+        index: index,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        imageFiles[index] = savedFile;
+        imagePaths[index] = savedFile.path;
+        _isStamping[index] = true;
+      });
+
+      unawaited(_stampSavedPhotoWithUi(
+        index: index,
+        savedPath: savedFile.path,
+        line1: lines['l1']!,
+        line2: lines['l2']!,
+        line3: lines['l3']!,
+      ));
+    } catch (e) {
+      _snack('Failed to upload image: $e');
+    }
+  }
+
+  // ✅ Gallery pick WITHOUT stamp
+  Future<void> _pickFromGalleryNoStamp(int index) async {
+    final picked = await picker.pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 92,
+    );
+    if (picked == null) return;
+
+    try {
+      final savedFile = await _copyPhotoToAppFolder(
+        sourcePath: picked.path,
         index: index,
       );
 
       setState(() {
         imageFiles[index] = savedFile;
         imagePaths[index] = savedFile.path;
+        _isStamping[index] = false;
       });
     } catch (e) {
       _snack('Failed to upload image: $e');
+    }
+  }
+
+  // ✅ Extra photo: stamp + save to gallery only
+  Future<void> _takeExtraPhotoSaveToGalleryOnly() async {
+    _captureGpsFast();
+
+    final lines = _buildStampLines();
+
+    final Map<String, String>? result = await Navigator.push<Map<String, String>?>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => TimestampCameraAwScreen(
+          overlayLine1: lines['l1']!,
+          overlayLine2: lines['l2']!,
+          overlayLine3: lines['l3']!,
+        ),
+      ),
+    );
+
+    if (result == null) return;
+
+    final rawPath = (result['rawPath'] ?? '').trim();
+    if (rawPath.isEmpty) return;
+
+    try {
+      final tmpCopy = await _copyExtraToTemp(sourcePath: rawPath);
+
+      await _stampUiAndOverwriteFile(
+        filePath: tmpCopy.path,
+        line1: lines['l1']!,
+        line2: lines['l2']!,
+        line3: lines['l3']!,
+      );
+
+      await _saveImageToGallery(tmpCopy);
+      _snack('Extra photo saved to Gallery ✅');
+    } catch (e) {
+      _snack('Extra photo failed: $e');
     }
   }
 
@@ -493,6 +618,7 @@ class _LocationEditScreenState extends State<LocationEditScreen>
       imageFiles[index] = null;
       imagePaths[index] = '';
       imageIssueIdsMap['$index'] = <String>[];
+      _isStamping[index] = false;
     });
 
     try {
@@ -545,6 +671,8 @@ class _LocationEditScreenState extends State<LocationEditScreen>
     required List<String> selectedIds,
     required ValueChanged<List<String>> onChanged,
   }) async {
+    _issuePickerOpen = true;
+
     final out = await showModalBottomSheet<List<String>>(
       context: context,
       isScrollControlled: true,
@@ -564,8 +692,7 @@ class _LocationEditScreenState extends State<LocationEditScreen>
                       Expanded(
                         child: Text(
                           title,
-                          style: const TextStyle(
-                              fontSize: 16, fontWeight: FontWeight.w800),
+                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
                         ),
                       ),
                       TextButton(
@@ -587,10 +714,8 @@ class _LocationEditScreenState extends State<LocationEditScreen>
                         allIssues: options,
                         selectedIds: temp,
                         onChanged: (ids) => temp = ids,
-                        onAddNewIssue: () => Navigator.pushNamed(
-                          context,
-                          IssuesMasterScreen.routeName,
-                        ),
+                        onAddNewIssue: () =>
+                            Navigator.pushNamed(context, IssuesMasterScreen.routeName),
                       ),
                     ),
                   ),
@@ -602,6 +727,7 @@ class _LocationEditScreenState extends State<LocationEditScreen>
       },
     );
 
+    _issuePickerOpen = false;
     if (out == null) return;
     onChanged(out);
   }
@@ -625,22 +751,46 @@ class _LocationEditScreenState extends State<LocationEditScreen>
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Text(
-                    'Image ${index + 1}',
-                    style: const TextStyle(
-                        fontSize: 16, fontWeight: FontWeight.w800),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'Image ${index + 1}',
+                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+                        ),
+                      ),
+                      if (_isStamping[index] == true)
+                        const Padding(
+                          padding: EdgeInsets.only(right: 6),
+                          child: Text(
+                            'Stamping…',
+                            style: TextStyle(fontSize: 12, color: Colors.black54),
+                          ),
+                        ),
+                    ],
                   ),
                   const SizedBox(height: 10),
+
                   ClipRRect(
                     borderRadius: BorderRadius.circular(12),
                     child: Container(
                       height: 180,
-                      color: Colors.black12,
+                      color: Colors.black,
                       child: f == null
-                          ? const Center(child: Text('No photo selected'))
-                          : Image.file(f, fit: BoxFit.cover),
+                          ? const Center(
+                              child: Text('No photo selected',
+                                  style: TextStyle(color: Colors.white70)),
+                            )
+                          : Image.file(
+                              f,
+                              fit: BoxFit.contain,
+                              cacheWidth: 1200,
+                              filterQuality: FilterQuality.low,
+                              gaplessPlayback: true,
+                            ),
                     ),
                   ),
+
                   const SizedBox(height: 10),
                   if ((resolvedAddress ?? '').trim().isNotEmpty)
                     Text(
@@ -648,12 +798,12 @@ class _LocationEditScreenState extends State<LocationEditScreen>
                       style: TextStyle(color: Colors.black.withOpacity(0.70)),
                     ),
                   const SizedBox(height: 12),
+
                   ElevatedButton.icon(
                     onPressed: () async {
                       Navigator.pop(ctx);
                       await _openIssuePicker(
-                        title:
-                            'Caption issues for Image ${index + 1} (Engineering only)',
+                        title: 'Caption issues for Image ${index + 1} (Engineering only)',
                         options: engineeringIssues,
                         selectedIds: imageIssueIdsMap['$index'] ?? [],
                         onChanged: (ids) =>
@@ -663,9 +813,18 @@ class _LocationEditScreenState extends State<LocationEditScreen>
                     icon: const Icon(Icons.list_alt),
                     label: const Text('Select caption issues'),
                   ),
-                  const Spacer(),
 
-                  // ✅ Camera + Gallery + Remove
+                  const SizedBox(height: 10),
+                  OutlinedButton.icon(
+                    onPressed: () async {
+                      Navigator.pop(ctx);
+                      await _takeExtraPhotoSaveToGalleryOnly();
+                    },
+                    icon: const Icon(Icons.add_a_photo_outlined),
+                    label: const Text('Take EXTRA photo (save to Gallery only)'),
+                  ),
+
+                  const Spacer(),
                   Column(
                     children: [
                       Row(
@@ -673,8 +832,9 @@ class _LocationEditScreenState extends State<LocationEditScreen>
                           Expanded(
                             child: ElevatedButton.icon(
                               onPressed: () async {
-                                Navigator.pop(ctx);
                                 await _takePhoto(index);
+                                if (!mounted) return;
+                                (ctx as Element).markNeedsBuild();
                               },
                               icon: const Icon(Icons.photo_camera),
                               label: const Text('Camera'),
@@ -684,8 +844,36 @@ class _LocationEditScreenState extends State<LocationEditScreen>
                           Expanded(
                             child: ElevatedButton.icon(
                               onPressed: () async {
-                                Navigator.pop(ctx);
-                                await _pickFromGallery(index);
+                                final choice = await showModalBottomSheet<String>(
+                                  context: context,
+                                  showDragHandle: true,
+                                  builder: (_) => SafeArea(
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        ListTile(
+                                          leading: const Icon(Icons.verified_outlined),
+                                          title: const Text('Upload WITH stamp'),
+                                          onTap: () => Navigator.pop(context, 'with'),
+                                        ),
+                                        ListTile(
+                                          leading: const Icon(Icons.hide_image_outlined),
+                                          title: const Text('Upload WITHOUT stamp'),
+                                          onTap: () => Navigator.pop(context, 'without'),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                );
+
+                                if (choice == 'with') {
+                                  await _pickFromGalleryWithStamp(index);
+                                } else if (choice == 'without') {
+                                  await _pickFromGalleryNoStamp(index);
+                                }
+
+                                if (!mounted) return;
+                                (ctx as Element).markNeedsBuild();
                               },
                               icon: const Icon(Icons.photo_library_outlined),
                               label: const Text('Gallery'),
@@ -698,8 +886,9 @@ class _LocationEditScreenState extends State<LocationEditScreen>
                         width: double.infinity,
                         child: OutlinedButton.icon(
                           onPressed: () async {
-                            Navigator.pop(ctx);
                             await _removePhoto(index);
+                            if (!mounted) return;
+                            if (Navigator.canPop(ctx)) Navigator.pop(ctx);
                           },
                           icon: const Icon(Icons.delete_outline),
                           label: const Text('Remove'),
@@ -718,15 +907,40 @@ class _LocationEditScreenState extends State<LocationEditScreen>
 
   Widget _imageGridCard(List<IssueModel> engineeringIssues) {
     Widget btn(int index) {
-      final has =
-          imagePaths[index].trim().isNotEmpty && imageFiles[index] != null;
-      return OutlinedButton.icon(
-        onPressed: () => _openImageSheet(
-            index: index, engineeringIssues: engineeringIssues),
-        icon: const Icon(Icons.image),
-        label: Text(has ? 'Image ${index + 1} ✅' : 'Image ${index + 1}'),
-        style: OutlinedButton.styleFrom(
-          padding: const EdgeInsets.symmetric(vertical: 14),
+      final has = imagePaths[index].trim().isNotEmpty && imageFiles[index] != null;
+      final thumb = imageFiles[index];
+
+      return OutlinedButton(
+        onPressed: () => _openImageSheet(index: index, engineeringIssues: engineeringIssues),
+        style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 12)),
+        child: Row(
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: Container(
+                width: 54,
+                height: 54,
+                color: Colors.black12,
+                child: thumb == null
+                    ? const Icon(Icons.image, size: 22)
+                    : Image.file(
+                        thumb,
+                        fit: BoxFit.cover,
+                        cacheWidth: 600,
+                        filterQuality: FilterQuality.low,
+                        gaplessPlayback: true,
+                      ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                has ? 'Image ${index + 1} ✅' : 'Image ${index + 1}',
+                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+              ),
+            ),
+            const Icon(Icons.chevron_right),
+          ],
         ),
       );
     }
@@ -737,24 +951,11 @@ class _LocationEditScreenState extends State<LocationEditScreen>
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            const Text('Images',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
+            const Text('Images', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
             const SizedBox(height: 10),
-            Row(
-              children: [
-                Expanded(child: btn(0)),
-                const SizedBox(width: 10),
-                Expanded(child: btn(1)),
-              ],
-            ),
+            Row(children: [Expanded(child: btn(0)), const SizedBox(width: 10), Expanded(child: btn(1))]),
             const SizedBox(height: 10),
-            Row(
-              children: [
-                Expanded(child: btn(2)),
-                const SizedBox(width: 10),
-                Expanded(child: btn(3)),
-              ],
-            ),
+            Row(children: [Expanded(child: btn(2)), const SizedBox(width: 10), Expanded(child: btn(3))]),
           ],
         ),
       ),
@@ -770,18 +971,15 @@ class _LocationEditScreenState extends State<LocationEditScreen>
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            const Text('Details',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
+            const Text('Details', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
             const SizedBox(height: 10),
             Row(
               children: [
                 Expanded(
                   child: TextFormField(
                     controller: locationNoC,
-                    decoration: const InputDecoration(
-                        labelText: 'Location No.', hintText: 'e.g., 01'),
-                    validator: (v) =>
-                        (v ?? '').trim().isEmpty ? 'Required' : null,
+                    decoration: const InputDecoration(labelText: 'Location No.', hintText: 'e.g., 01'),
+                    validator: (v) => (v ?? '').trim().isEmpty ? 'Required' : null,
                   ),
                 ),
                 const SizedBox(width: 10),
@@ -792,6 +990,7 @@ class _LocationEditScreenState extends State<LocationEditScreen>
                     items: const [
                       DropdownMenuItem(value: 'NHAI', child: Text('NHAI')),
                       DropdownMenuItem(value: 'PWD', child: Text('PWD')),
+                      DropdownMenuItem(value: 'ULB', child: Text('Urban/Local Body')),
                     ],
                     onChanged: (v) => setState(() => agency = v ?? 'NHAI'),
                   ),
@@ -807,16 +1006,7 @@ class _LocationEditScreenState extends State<LocationEditScreen>
             const SizedBox(height: 10),
             TextFormField(
               controller: policeC,
-              decoration: const InputDecoration(
-                  labelText: 'Police Station (Jurisdiction)'),
-            ),
-            const SizedBox(height: 10),
-            TextFormField(
-              controller: detailsC,
-              minLines: 2,
-              maxLines: 3,
-              decoration: const InputDecoration(
-                  labelText: 'Engineering Details (shared)'),
+              decoration: const InputDecoration(labelText: 'Police Station (Jurisdiction)'),
             ),
             const SizedBox(height: 10),
             Row(
@@ -838,10 +1028,8 @@ class _LocationEditScreenState extends State<LocationEditScreen>
             ),
             if ((resolvedAddress ?? '').trim().isNotEmpty) ...[
               const SizedBox(height: 6),
-              Text(
-                'Address: ${resolvedAddress!}',
-                style: TextStyle(color: Colors.black.withOpacity(0.7)),
-              ),
+              Text('Address: ${resolvedAddress!}',
+                  style: TextStyle(color: Colors.black.withOpacity(0.7))),
             ],
           ],
         ),
@@ -849,7 +1037,6 @@ class _LocationEditScreenState extends State<LocationEditScreen>
     );
   }
 
-  // ------------------ save ------------------
   Future<void> _save() async {
     final ok = _formKey.currentState?.validate() ?? false;
     if (!ok) return;
@@ -865,7 +1052,7 @@ class _LocationEditScreenState extends State<LocationEditScreen>
         locationName: locationNameC.text.trim(),
         agency: agency,
         policeStation: policeC.text.trim(),
-        details: detailsC.text.trim(),
+        details: '',
         lat: lat,
         lng: lng,
         imagePaths: List<String>.from(imagePaths),
@@ -894,7 +1081,6 @@ class _LocationEditScreenState extends State<LocationEditScreen>
     }
   }
 
-  // ------------------ UI ------------------
   @override
   Widget build(BuildContext context) {
     final isEdit = widget.args.locationId != null;
@@ -907,10 +1093,7 @@ class _LocationEditScreenState extends State<LocationEditScreen>
           labelColor: Colors.white,
           unselectedLabelColor: Colors.white70,
           indicatorColor: Colors.white,
-          tabs: const [
-            Tab(text: 'Engineering'),
-            Tab(text: 'Enforcement'),
-          ],
+          tabs: const [Tab(text: 'Engineering'), Tab(text: 'Enforcement')],
         ),
       ),
       body: loading
@@ -918,9 +1101,7 @@ class _LocationEditScreenState extends State<LocationEditScreen>
           : StreamBuilder<List<IssueModel>>(
               stream: fs.watchAllIssues(),
               builder: (context, snap) {
-                if (!snap.hasData) {
-                  return const Center(child: CircularProgressIndicator());
-                }
+                if (!snap.hasData) return const Center(child: CircularProgressIndicator());
 
                 final all = snap.data!;
                 final engineeringIssues = _onlyCategory(all, 'ENGINEERING');
@@ -942,28 +1123,22 @@ class _LocationEditScreenState extends State<LocationEditScreen>
                                 child: Padding(
                                   padding: const EdgeInsets.all(14),
                                   child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.stretch,
+                                    crossAxisAlignment: CrossAxisAlignment.stretch,
                                     children: [
                                       Row(
                                         children: [
                                           const Expanded(
                                             child: Text(
                                               'Engineering Issues',
-                                              style: TextStyle(
-                                                  fontSize: 16,
-                                                  fontWeight: FontWeight.w800),
+                                              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
                                             ),
                                           ),
                                           ElevatedButton.icon(
                                             onPressed: () => _openIssuePicker(
-                                              title:
-                                                  'Select Engineering Issues',
+                                              title: 'Select Engineering Issues',
                                               options: engineeringIssues,
                                               selectedIds: engineeringIssueIds,
-                                              onChanged: (ids) => setState(
-                                                  () =>
-                                                      engineeringIssueIds = ids),
+                                              onChanged: (ids) => setState(() => engineeringIssueIds = ids),
                                             ),
                                             icon: const Icon(Icons.add),
                                             label: const Text('Add'),
@@ -974,8 +1149,7 @@ class _LocationEditScreenState extends State<LocationEditScreen>
                                       _selectedChips(
                                         options: engineeringIssues,
                                         selectedIds: engineeringIssueIds,
-                                        onChanged: (ids) => setState(
-                                            () => engineeringIssueIds = ids),
+                                        onChanged: (ids) => setState(() => engineeringIssueIds = ids),
                                       ),
                                     ],
                                   ),
@@ -992,28 +1166,22 @@ class _LocationEditScreenState extends State<LocationEditScreen>
                                 child: Padding(
                                   padding: const EdgeInsets.all(14),
                                   child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.stretch,
+                                    crossAxisAlignment: CrossAxisAlignment.stretch,
                                     children: [
                                       Row(
                                         children: [
                                           const Expanded(
                                             child: Text(
                                               'Enforcement Issues',
-                                              style: TextStyle(
-                                                  fontSize: 16,
-                                                  fontWeight: FontWeight.w800),
+                                              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
                                             ),
                                           ),
                                           ElevatedButton.icon(
                                             onPressed: () => _openIssuePicker(
-                                              title:
-                                                  'Select Enforcement Issues',
+                                              title: 'Select Enforcement Issues',
                                               options: enforcementIssues,
                                               selectedIds: enforcementIssueIds,
-                                              onChanged: (ids) => setState(
-                                                  () => enforcementIssueIds =
-                                                      ids),
+                                              onChanged: (ids) => setState(() => enforcementIssueIds = ids),
                                             ),
                                             icon: const Icon(Icons.add),
                                             label: const Text('Add'),
@@ -1024,8 +1192,7 @@ class _LocationEditScreenState extends State<LocationEditScreen>
                                       _selectedChips(
                                         options: enforcementIssues,
                                         selectedIds: enforcementIssueIds,
-                                        onChanged: (ids) => setState(
-                                            () => enforcementIssueIds = ids),
+                                        onChanged: (ids) => setState(() => enforcementIssueIds = ids),
                                       ),
                                     ],
                                   ),
@@ -1045,16 +1212,13 @@ class _LocationEditScreenState extends State<LocationEditScreen>
                         child: Container(
                           padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
                           decoration: BoxDecoration(
-                            color:
-                                Theme.of(context).scaffoldBackgroundColor,
-                            border: const Border(
-                                top: BorderSide(color: Colors.black12)),
+                            color: Theme.of(context).scaffoldBackgroundColor,
+                            border: const Border(top: BorderSide(color: Colors.black12)),
                           ),
                           child: ElevatedButton.icon(
                             onPressed: saving ? null : _save,
                             icon: const Icon(Icons.save),
-                            label: Text(
-                                isEdit ? 'Save Changes' : 'Save Location'),
+                            label: Text(isEdit ? 'Save Changes' : 'Save Location'),
                           ),
                         ),
                       ),
@@ -1062,8 +1226,7 @@ class _LocationEditScreenState extends State<LocationEditScreen>
                     if (saving)
                       Container(
                         color: Colors.black.withOpacity(0.08),
-                        child: const Center(
-                            child: CircularProgressIndicator()),
+                        child: const Center(child: CircularProgressIndicator()),
                       ),
                   ],
                 );

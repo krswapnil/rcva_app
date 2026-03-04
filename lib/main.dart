@@ -1,7 +1,10 @@
-// lib/main.dart
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:media_store_plus/media_store_plus.dart';
 
 import 'services/firestore_service.dart';
 import 'seed/issues_seed.dart';
@@ -19,10 +22,19 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp();
 
-  // ✅ seed on startup (only if empty)
+  if (Platform.isAndroid) {
+    await MediaStore.ensureInitialized();
+  }
+
   final fs = FirestoreService();
-  await fs.seedIfEmpty(issuesSeed);
-  await fs.debugCountIssues();
+
+  // ✅ Prefer the newer, safe initializer (handles category/source migrations)
+  await fs.ensureIssuesReady(issuesSeed);
+
+  // ✅ Debug prints only in debug mode (won't break release builds)
+  if (kDebugMode) {
+    await fs.debugCategoryCounts(); // this exists in the updated service
+  }
 
   runApp(const RCVAApp());
 }
@@ -36,8 +48,6 @@ class RCVAApp extends StatelessWidget {
       title: 'RCVA Field',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light(),
-
-      // ✅ Auth gate here (no initialRoute, no "/" route in routes)
       home: StreamBuilder<User?>(
         stream: FirebaseAuth.instance.authStateChanges(),
         builder: (context, snap) {
@@ -48,26 +58,17 @@ class RCVAApp extends StatelessWidget {
           }
 
           final user = snap.data;
-          if (user == null) {
-            return const LoginScreen();
-          }
-
+          if (user == null) return const LoginScreen();
           return const ReportsHomeScreen();
         },
       ),
-
-      // ✅ IMPORTANT:
-      // Do NOT include ReportsHomeScreen.routeName if it's "/" (defaultRouteName),
-      // because home is already set.
       routes: {
         IssuesMasterScreen.routeName: (_) => const IssuesMasterScreen(),
         CreateReportScreen.routeName: (_) => const CreateReportScreen(),
-
         ReportDetailScreen.routeName: (ctx) {
           final reportId = ModalRoute.of(ctx)!.settings.arguments as String;
           return ReportDetailScreen(reportId: reportId);
         },
-
         LocationEditScreen.routeName: (ctx) {
           final args = ModalRoute.of(ctx)!.settings.arguments as LocationEditArgs;
           return LocationEditScreen(args: args);

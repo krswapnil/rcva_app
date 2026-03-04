@@ -10,12 +10,17 @@ class AuthService {
   Stream<User?> authStateChanges() => _auth.authStateChanges();
   User? get currentUser => _auth.currentUser;
 
-  /// ✅ Forces account chooser every time
+  /// ✅ Normal sign-in (keeps user logged in across app restarts)
   Future<UserCredential> signInWithGoogle() async {
-    // This forces Google to forget the last-used account
-    await _googleSignIn.signOut();
+    // Do NOT signOut here. This is what was causing “logout on close”.
+    // await _googleSignIn.signOut(); ❌ remove
 
-    final GoogleSignInAccount? gUser = await _googleSignIn.signIn();
+    // Try to reuse existing Google session first (faster, no chooser)
+    GoogleSignInAccount? gUser = await _googleSignIn.signInSilently();
+
+    // If no cached session, show the sign-in UI
+    gUser ??= await _googleSignIn.signIn();
+
     if (gUser == null) {
       throw Exception('Sign-in cancelled');
     }
@@ -30,14 +35,29 @@ class AuthService {
     return _auth.signInWithCredential(credential);
   }
 
-  /// ✅ Full logout: Firebase + Google signOut + disconnect
+  /// ✅ Optional: if you want an explicit "Switch Account" flow
+  Future<UserCredential> signInWithGoogleForceChooser() async {
+    // This forces account chooser
+    await _googleSignIn.signOut();
+    final gUser = await _googleSignIn.signIn();
+    if (gUser == null) throw Exception('Sign-in cancelled');
+
+    final gAuth = await gUser.authentication;
+
+    final credential = GoogleAuthProvider.credential(
+      accessToken: gAuth.accessToken,
+      idToken: gAuth.idToken,
+    );
+
+    return _auth.signInWithCredential(credential);
+  }
+
+  /// ✅ Full logout (user-initiated)
   Future<void> signOut() async {
     await _auth.signOut();
     await _googleSignIn.signOut();
 
-    // Disconnect clears cached auth so chooser shows next time
-    try {
-      await _googleSignIn.disconnect();
-    } catch (_) {}
+    // Optional: disconnect clears cached auth (use only if you WANT this behavior)
+    // try { await _googleSignIn.disconnect(); } catch (_) {}
   }
 }

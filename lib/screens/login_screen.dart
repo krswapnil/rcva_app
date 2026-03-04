@@ -13,10 +13,14 @@ class _LoginScreenState extends State<LoginScreen> {
   final auth = AuthService();
   bool loading = false;
 
-  Future<void> _login() async {
+  Future<void> _login({bool forceChooser = false}) async {
     setState(() => loading = true);
     try {
-      await auth.signInWithGoogle();
+      if (forceChooser) {
+        await auth.signInWithGoogleForceChooser();
+      } else {
+        await auth.signInWithGoogle();
+      }
       // authStateChanges will auto-navigate via main routing
     } catch (e) {
       if (!mounted) return;
@@ -45,10 +49,11 @@ class _LoginScreenState extends State<LoginScreen> {
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 18),
+
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton.icon(
-                  onPressed: loading ? null : _login,
+                  onPressed: loading ? null : () => _login(),
                   icon: loading
                       ? const SizedBox(
                           width: 18,
@@ -57,6 +62,17 @@ class _LoginScreenState extends State<LoginScreen> {
                         )
                       : const Icon(Icons.login),
                   label: Text(loading ? 'Signing in...' : 'Sign in with Google'),
+                ),
+              ),
+
+              const SizedBox(height: 10),
+
+              // Optional: only if you want manual “switch account”
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton(
+                  onPressed: loading ? null : () => _login(forceChooser: true),
+                  child: const Text('Use another account'),
                 ),
               ),
             ],
